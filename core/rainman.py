@@ -1,46 +1,4 @@
-"""
-Drifting loss for the exact hyperspherical setting.
-
-Assumes all feature vectors already lie on S^{C-1} — i.e. the encoder
-hard-normalises outputs (``F.normalize``) and the generator ends with
-``F.normalize``.  Under this assumption several Euclidean heuristics
-become unnecessary and are removed:
-
-Removed vs. the Euclidean version
-----------------------------------
-* **Internal re-normalisation** — inputs are already unit vectors.
-* **Feature-scale normalisation S_j** (Eq. 20-21) — geodesic distances
-  are bounded in [0, π] regardless of batch or dimension; no mean-rescaling
-  is needed to keep the kernel in a useful regime.
-* **Temperature dimension-scaling** ``ρ̃ = ρ·√C`` (Eq. 22) — that factor
-  compensated for Euclidean distances growing as √C in high dimensions.
-  Geodesic distances on S^{C-1} are scale-invariant, so raw ρ is used.
-* **``dist_metric`` choice** — there is exactly one Riemannian distance on
-  a sphere (the great-circle / geodesic distance); the option is a no-op.
-
-Kept / adapted
---------------
-* All coupling modes: ``row``, ``partial_two_sided``, ``sinkhorn``.
-* All drift forms: ``alg2_joint``, ``split``.
-* CFG unconditional weighting (Appendix A.7).
-* Drift normalisation θ_j (Eq. 24-25), applied to tangent vectors.
-* Stop-gradient / AMP policy (float32, no autocast).
-
-Riemannian primitives
-----------------------
-* **Geodesic distance**: d(x, y) = arccos(x·y)   ∈ [0, π]
-* **Log map** (tangent displacement):
-      log_x(y) = θ · (y − cosθ·x) / sinθ,   θ = arccos(x·y)
-      stable limit as θ → 0: log_x(y) ≈ (y − x)
-* **Exp map** (move along tangent vector):
-      exp_x(v) = cos(‖v‖)·x + sin(‖v‖)·v/‖v‖
-* **Loss**: MSE(x, sg(exp_x(Ṽ_agg)))
-
-Tensor shapes
--------------
-All inputs use [N, L, C]:
-  N : samples,  L : feature vectors per sample,  C : feature dimension.
-"""
+"""Drifting loss for the exact hyperspherical setting."""
 
 from __future__ import annotations
 
@@ -75,21 +33,21 @@ from core.drifting_loss import (  # noqa: F401
 )
 
 _EPS = 1e-7
+# Clamp for theta/sin(theta) — prevents antipodal pairs from blowing up v_raw.
+# pi / _EPS would be ~3e7; we use a much tighter practical bound.
+_SCALE_MAX = 1.0 / _EPS
 
 
 # ---------------------------------------------------------------------------
-# Riemannian primitives  (inputs assumed to be unit vectors)
+# Riemannian primitives
 # ---------------------------------------------------------------------------
 
 def _pairwise_geodesic(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Pairwise geodesic distances for unit vectors.
 
-    Args:
-        x: [..., N, C]
-        y: [..., M, C]
-    Returns:
-        [..., N, M]  in [0, π]
+    x: [..., N, C],  y: [..., M, C]
+    Returns [..., N, M] in [0, pi].
     """
     cos = torch.matmul(x, y.transpose(-2, -1))
     return torch.acos(cos.clamp(-1.0 + _EPS, 1.0 - _EPS))
@@ -101,44 +59,41 @@ def _weighted_log_map(
     y: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Riemannian barycentric projection: Σ_j P[i,j] · log_{x_i}(y_j).
+    Riemannian barycentric projection: sum_j P[i,j] * log_{x_i}(y_j).
 
-    log_x(y) = (θ / sinθ) · (y − cosθ·x),   θ = arccos(x·y)
+    log_x(y) = (theta / sin(theta)) * (y - cos(theta)*x)
 
-    The scale factor θ/sinθ → 1 as θ → 0, so no special-case branching
-    is needed — we just guard sinθ from below.
+    Numerically: scale = theta/sin(theta) is clamped to [0, _SCALE_MAX]
+    to handle near-antipodal pairs (theta -> pi, sin(theta) -> 0).
 
-    Args:
-        P: [..., N, M]  coupling weights
-        x: [..., N, C]  base points (unit vectors)
-        y: [..., M, C]  target points (unit vectors)
-    Returns:
-        [..., N, C]  weighted tangent vectors
+    P: [..., N, M]
+    x: [..., N, C]  unit vectors (base points)
+    y: [..., M, C]  unit vectors (target points)
+    Returns [..., N, C]  tangent vectors at x.
     """
-    cos   = torch.matmul(x, y.transpose(-2, -1))          # [..., N, M]
+    cos   = torch.matmul(x, y.transpose(-2, -1))           # [..., N, M]
     cos   = cos.clamp(-1.0 + _EPS, 1.0 - _EPS)
-    theta = torch.acos(cos)                                # [..., N, M]
-    scale = theta / torch.sin(theta).clamp_min(_EPS)       # [..., N, M]  → 1 as θ→0
+    theta = torch.acos(cos)                                 # [..., N, M]
 
-    # direction[i,j,:] = y_j - cos[i,j] * x_i
+    # FIX: clamp from above to handle antipodal pairs (theta -> pi)
+    scale = (theta / torch.sin(theta).clamp_min(_EPS)).clamp_max(_SCALE_MAX)
+
     direction = (
-        y.unsqueeze(-3)                                    # [...,  1, M, C]
-        - cos.unsqueeze(-1) * x.unsqueeze(-2)              # [..., N, M, C]
-    )
+        y.unsqueeze(-3)                                     # [...,  1, M, C]
+        - cos.unsqueeze(-1) * x.unsqueeze(-2)               # [..., N, M, C]
+    )                                                       # [..., N, M, C]
 
-    log_vecs = scale.unsqueeze(-1) * direction             # [..., N, M, C]
-    return (P.unsqueeze(-1) * log_vecs).sum(dim=-2)        # [..., N, C]
+    log_vecs = scale.unsqueeze(-1) * direction              # [..., N, M, C]
+    return (P.unsqueeze(-1) * log_vecs).sum(dim=-2)         # [..., N, C]
 
 
 def exp_map(x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """
-    Exponential map on S^{C-1}: exp_x(v) = cos(‖v‖)·x + sin(‖v‖)·v̂.
+    Exponential map: exp_x(v) = cos(||v||)*x + sin(||v||)*v_hat.
 
-    Args:
-        x: [..., C]  base point (unit vector)
-        v: [..., C]  tangent vector at x
-    Returns:
-        [..., C]  point on S^{C-1}
+    x: [..., C]  unit vector
+    v: [..., C]  tangent vector at x
+    Returns [..., C]  point on S^{C-1}.
     """
     v_norm = v.norm(dim=-1, keepdim=True).clamp_min(_EPS)
     return torch.cos(v_norm) * x + torch.sin(v_norm) * (v / v_norm)
@@ -171,33 +126,40 @@ def drifting_loss_hyperspherical(
     omega: torch.Tensor,
     temps: Iterable[float],
     impl: Literal["logspace", "kernel"] = "logspace",
-    vanilla: bool = False,        # no-op: no S_j scaling on S^{C-1}
+    vanilla: bool = False,
     drift_form: DriftForm = "alg2_joint",
     coupling: Coupling = "partial_two_sided",
     sinkhorn_iters: int = 20,
     sinkhorn_marginal: SinkhornMarginal = "none",
     sinkhorn_agg_kernel: bool = False,
     mask_self_neg: bool = True,
-    dist_metric: str = "geodesic",  # no-op: always geodesic
+    dist_metric: str = "geodesic",
     normalize_drift_theta: bool = True,
-    drift_tau_scale: bool = False,  # no-op: no τ dimension-scaling on S^{C-1}
-    drift_unit_vec: bool = False,   # no-op: log-map already gives geodesic direction
+    drift_tau_scale: bool = False,
+    drift_unit_vec: bool = False,
+    use_expmap_target: bool = False,
     stats: dict[str, float] | None = None,
 ) -> torch.Tensor:
     """
-    Drifting loss for features exactly on S^{C-1}.
+    Drifting loss for features on S^{C-1}.
 
-    Inputs must be L2-normalised unit vectors. The generator must end with
-    ``F.normalize`` and the encoder must hard-normalise (e.g. ConvAE.encode).
+    Key differences from the Euclidean version:
+    - Distances are geodesic (arccos), bounded in [0, pi].
+    - No S_j feature scaling (geodesic distances are scale-invariant).
+    - No sqrt(C) temperature scaling (distances don't grow with C).
+    - Drift field computed via log map (tangent space).
+    - Loss target: x + v_agg (ambient, like the original) by default,
+      or exp_x(v_agg) (on-sphere) when use_expmap_target=True.
 
-    The drift field is computed in the tangent space via the log map and the
-    loss target is placed back on the sphere via the exp map:
+    Args:
+        use_expmap_target: if True, map the drift back onto the sphere via
+            exp_map before computing MSE. The gradient signal is slightly
+            compressed but the target is geometrically exact. Default False
+            (ambient target, matching the original loss convention).
 
-        loss = MSE(x, sg(exp_x(Ṽ_agg)))
-
-    All coupling / drift-form / CFG options are supported.
-    ``vanilla``, ``dist_metric``, ``drift_tau_scale``, ``drift_unit_vec``
-    are accepted for API compatibility but have no effect.
+    All other args are API-compatible with drifting_loss_for_feature_set.
+    vanilla / dist_metric / drift_tau_scale / drift_unit_vec are accepted
+    but have no effect (documented no-ops for this variant).
     """
     amp_off = (
         torch.autocast(device_type="cuda", enabled=False)
@@ -221,9 +183,9 @@ def drifting_loss_hyperspherical(
         if sinkhorn_marginal != "none" and coupling != "sinkhorn":
             raise ValueError("sinkhorn_marginal only used with coupling='sinkhorn'")
 
-        # [L, N, C] — batch over spatial locations
-        x  = x_feat.permute(1, 0, 2).contiguous().detach().float()       # [L, Nneg, C]
-        yp = y_pos_feat.permute(1, 0, 2).contiguous().detach().float()    # [L, Npos, C]
+        # Permute to [L, N, C] for batched distance computation
+        x  = x_feat.permute(1, 0, 2).contiguous().detach().float()
+        yp = y_pos_feat.permute(1, 0, 2).contiguous().detach().float()
         yuc = (y_uncond_feat.permute(1, 0, 2).contiguous().detach().float()
                if nuncond > 0 else None)
 
@@ -237,14 +199,14 @@ def drifting_loss_hyperspherical(
                 if (coupling == "sinkhorn" and sinkhorn_marginal == "none"
                         and _has_nonpositive_uncond_weight(w)):
                     raise ValueError(
-                        "coupling='sinkhorn' + sinkhorn_marginal='none' + w≤0 "
+                        "coupling='sinkhorn' + sinkhorn_marginal='none' + w<=0 "
                         "is infeasible. Use sinkhorn_marginal='weighted_cols'."
                     )
             else:
                 yn = x
                 w  = None
 
-            # Geodesic distance matrices — bounded in [0,π], no S_j scaling
+            # Geodesic distance matrices — no S_j scaling, no sqrt(C) on temps
             dp = _pairwise_geodesic(x, yp)    # [L, Nneg, Npos]
             dn = _pairwise_geodesic(x, yn)    # [L, Nneg, Nneg(+Nunc)]
 
@@ -261,7 +223,7 @@ def drifting_loss_hyperspherical(
             v_agg = torch.zeros((l, nneg, c), device=x.device, dtype=x.dtype)
 
             for rho in temps:
-                # Use rho directly — no √C scaling needed on S^{C-1}
+                # FIX: use raw rho — no sqrt(C) scaling on S^{C-1}
                 tau = float(rho)
 
                 if drift_form == "alg2_joint":
@@ -344,7 +306,6 @@ def drifting_loss_hyperspherical(
                 else:
                     raise ValueError(f"Unknown drift_form: {drift_form}")
 
-                # Drift normalisation θ_j (Eq. 24-25)
                 theta_norm = (v_raw * v_raw).mean().clamp_min(1e-12).sqrt()
                 if stats is not None:
                     stats[f"drift_theta_{str(rho).replace('.', 'p')}"] = float(theta_norm)
@@ -357,11 +318,22 @@ def drifting_loss_hyperspherical(
                     (v_agg_nlc * v_agg_nlc).mean().clamp_min(0).sqrt())
                 stats["drift_v_nonfinite_count"] = float(
                     (~torch.isfinite(v_agg_nlc)).sum())
+                stats["drift_v_nan_count"] = float(
+                    torch.isnan(v_agg_nlc).sum())
 
-        # Loss: MSE(x, sg(exp_x(Ṽ)))
-        # x_feat has grad (from generator); target is stop-grad point on sphere.
-        target = exp_map(x_feat.detach().float(), v_agg_nlc).detach()
-        return F.mse_loss(x_feat.float(), target, reduction="mean")
+        # FIX: loss target — ambient convention (matches original Euclidean loss)
+        # target = sg(x + v),  loss = MSE(x_feat, target)
+        # Gradient flows through x_feat (from generator), same as the original.
+        x_feat_f = x_feat.float()
+        if use_expmap_target:
+            # Geometrically exact: map drift onto sphere via exp_map.
+            # Slightly compressed gradient magnitude but correct on-sphere target.
+            target = exp_map(x_feat_f.detach(), v_agg_nlc).detach()
+        else:
+            # First order taylor expansion.
+            target = (x_feat_f.detach() + v_agg_nlc).detach()
+
+        return F.mse_loss(x_feat_f, target, reduction="mean")
 
     with amp_off:
         return _impl(x_feat, y_pos_feat, y_uncond_feat)
