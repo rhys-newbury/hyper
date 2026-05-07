@@ -98,6 +98,26 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--run-root", type=str, default="runs/mnist_drift")
     p.add_argument("--run-name", type=str, default=None)
 
+    # Hyperspherical drifting
+    p.add_argument(
+        "--vmf",
+        action="store_true",
+        help="Use von Mises-Fisher marginals for Sinkhorn coupling.",
+    )
+    p.add_argument(
+        "--use-first-order",
+        action="store_true",
+        help="Use first-order target x + v instead of the exact exp-map target.",
+    )
+    p.add_argument(
+        "--kappa",
+        type=float,
+        default=1.0,
+        help="vMF concentration parameter (kappa=0 recovers uniform marginals).",
+    )
+
+
+
     return p.parse_args()
 
 
@@ -154,17 +174,29 @@ def sample_grid(
     omega: float,
     nrow: int,
     device: torch.device,
+    latent_mean: torch.Tensor,
+    latent_std: torch.Tensor,
 ) -> torch.Tensor:
     """Generate 10-class grid using the generator + AE decoder."""
     all_imgs = []
     for c in range(gen.num_classes):
-        noise = torch.randn(nrow, gen.noise_dim, device=device)
+        
+        noise = F.normalize(torch.randn(nrow, gen.noise_dim, device=device), dim=-1)
         labels = torch.full((nrow,), c, dtype=torch.long, device=device)
         omegas = torch.full((nrow,), omega, device=device)
-        z = gen(noise, labels, omegas)
+        s = gen(noise, labels, omegas)
+        z_norm = stereo_inverse(s)               # (nrow, D)   standardized
+        z = z_norm * latent_std + latent_mean    # (nrow, D)   raw AE latent
         imgs = ae.decode(z)
         all_imgs.append(imgs)
     return torch.cat(all_imgs, dim=0)
+
+def stereo_inverse(s: torch.Tensor) -> torch.Tensor:
+    """S^d -> R^d. Inverse of stereographic projection."""
+    s_body = s[..., :-1]
+    s_last = s[..., -1:].clamp(max=1.0 - 1e-6)
+    return s_body / (1.0 - s_last)
+
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +222,16 @@ def main() -> None:
     ae_dir = os.path.dirname(args.ae_ckpt)
     train_z = np.load(os.path.join(ae_dir, "train_latents.npy"))
     train_y = np.load(os.path.join(ae_dir, "train_labels.npy"))
+
+    # Load stats saved by encode_latents.py for inverting the projection.
+    latent_mean = torch.from_numpy(
+        np.load(os.path.join(ae_dir, "latent_mean.npy"))
+    ).float().to(device)
+    latent_std = torch.from_numpy(
+        np.load(os.path.join(ae_dir, "latent_std.npy"))
+    ).float().to(device)
+
+
     dataset = LatentDataset(train_z, train_y, device)
     print(f"Loaded {len(train_z)} train latents, {dataset.num_classes} classes")
 
@@ -197,7 +239,7 @@ def main() -> None:
     gen = MLPGenerator(
         num_classes=dataset.num_classes,
         noise_dim=args.noise_dim,
-        latent_dim=latent_dim,
+        latent_dim=latent_dim+1,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
     ).to(device)
@@ -242,7 +284,7 @@ def main() -> None:
 
         for c in range(nc):
             # Noise -> generator -> latent.
-            noise = torch.randn(args.nneg, args.noise_dim, device=device)
+            noise = F.normalize(torch.randn(args.nneg, args.noise_dim, device=device), dim=-1)
             c_labels = torch.full((args.nneg,), c, dtype=torch.long, device=device)
             omega_rep = omega.expand(args.nneg)
             x_lat = gen(noise, c_labels, omega_rep)  # [nneg, latent_dim]
@@ -276,10 +318,13 @@ def main() -> None:
                 sinkhorn_agg_kernel=bool(args.sinkhorn_agg_kernel),
                 mask_self_neg=mask_self_neg,
                 dist_metric=args.dist_metric,
-                normalize_drift_theta=True,
+                normalize_drift_theta=False,
                 drift_tau_scale=bool(args.drift_tau_scale),
                 # drift_unit_vec=bool(args.drift_unit_vec),
                 stats=stats,
+                use_expmap_target=not args.use_first_order,
+                vmf_marginals=args.vmf,
+                vmf_kappa=args.kappa
             )
 
             # Accumulate (average over classes).
@@ -313,7 +358,7 @@ def main() -> None:
             orig_state = {n: p.clone() for n, p in gen.named_parameters() if p.requires_grad}
             ema.copy_to(gen)
 
-            grid = sample_grid(gen, ae, omega=args.sample_omega, nrow=args.sample_nrow, device=device)
+            grid = sample_grid(gen, ae, omega=args.sample_omega, nrow=args.sample_nrow, device=device, latent_mean=latent_mean, latent_std=latent_std)
             fig_path = os.path.join(run_dir, f"sample_step{step}.png")
             save_image(grid, fig_path, nrow=args.sample_nrow, padding=1)
             print(f"  -> saved sample grid: {fig_path}")

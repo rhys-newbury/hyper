@@ -46,7 +46,7 @@ class ConvAE(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, 1, 28, 28] -> [B, latent_dim]"""
         z = self.encoder(x)
-        return F.normalize(z, p=2, dim=1)
+        return z
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """z: [B, latent_dim] -> [B, 1, 28, 28]"""
@@ -93,7 +93,7 @@ class MLPGenerator(nn.Module):
         in_dim = noise_dim + class_emb_dim + omega_emb_dim
         layers: list[nn.Module] = []
         for _ in range(num_layers):
-            layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True)])
+            layers.extend([nn.Linear(in_dim, hidden_dim), nn.SiLU(inplace=True)])
             in_dim = hidden_dim
         layers.append(nn.Linear(hidden_dim, latent_dim))
         self.mlp = nn.Sequential(*layers)
@@ -116,4 +116,4 @@ class MLPGenerator(nn.Module):
         c_emb = self.class_emb(cls)
         o_emb = self.omega_mlp(omega.view(b, 1))
         inp = torch.cat([noise, c_emb, o_emb], dim=-1)
-        return F.normalize(self.mlp(inp), p=2, dim=-1)  # project onto S^{latent_dim - 1}
+        return F.normalize(self.mlp(inp), p=2, dim=-1)
