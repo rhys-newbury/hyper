@@ -762,6 +762,7 @@ def main() -> None:
             "perclass": {CLASS_NAMES[i]: v for i, v in emd_perclass.items()},
         },
     }
+    os.mkdir(args.save_path)
     torch.save(checkpoint, args.save_path)
     print(f"\n[save]   model → {args.save_path}")
 

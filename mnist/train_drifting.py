@@ -31,6 +31,7 @@ from core.rainman import (
 )
 from core.models.ema import EMA
 from mnist.models import ConvAE, MLPGenerator
+from mnist.vmf_vae import ConvModelVAE
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +46,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--data-root", type=str, default="./data")
 
     # Generator architecture.
-    p.add_argument("--noise-dim", type=int, default=6)
+    p.add_argument("--noise-dim", type=int, default=16)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--num-layers", type=int, default=3)
 
@@ -95,7 +96,7 @@ def _parse_args() -> argparse.Namespace:
     # Misc.
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--run-root", type=str, default="runs/mnist_drift")
+    p.add_argument("--run-root", type=str, default="runs/mnist_sweep")
     p.add_argument("--run-name", type=str, default=None)
 
     # Hyperspherical drifting
@@ -174,8 +175,6 @@ def sample_grid(
     omega: float,
     nrow: int,
     device: torch.device,
-    latent_mean: torch.Tensor,
-    latent_std: torch.Tensor,
 ) -> torch.Tensor:
     """Generate 10-class grid using the generator + AE decoder."""
     all_imgs = []
@@ -184,9 +183,9 @@ def sample_grid(
         noise = F.normalize(torch.randn(nrow, gen.noise_dim, device=device), dim=-1)
         labels = torch.full((nrow,), c, dtype=torch.long, device=device)
         omegas = torch.full((nrow,), omega, device=device)
-        s = gen(noise, labels, omegas)
-        z_norm = stereo_inverse(s)               # (nrow, D)   standardized
-        z = z_norm * latent_std + latent_mean    # (nrow, D)   raw AE latent
+        z = gen(noise, labels, omegas)
+        # z_norm = stereo_inverse(s)               # (nrow, D)   standardized
+        # z = z_norm * latent_std + latent_mean    # (nrow, D)   raw AE latent
         imgs = ae.decode(z)
         all_imgs.append(imgs)
     return torch.cat(all_imgs, dim=0)
@@ -210,26 +209,27 @@ def main() -> None:
 
     # --- Load AE ---
     ae_ckpt = torch.load(args.ae_ckpt, map_location="cpu", weights_only=True)
-    latent_dim = ae_ckpt["latent_dim"]
-    ae = ConvAE(latent_dim=latent_dim).to(device)
-    ae.load_state_dict(ae_ckpt["model"])
+    latent_dim = 16 #ae_ckpt["latent_dim"]
+    ae = ConvModelVAE(z_dim=latent_dim, distribution="vmf").to(device)
+    state = ae_ckpt.get("model_state_dict", ae_ckpt.get("model"))
+    ae.load_state_dict(state)
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
-    print(f"AE: latent_dim={latent_dim}, epoch={ae_ckpt['epoch']}, test_loss={ae_ckpt['test_loss']:.6f}")
+    # print(f"AE: latent_dim={latent_dim}, epoch={ae_ckpt['epoch']}, test_loss={ae_ckpt['test_loss']:.6f}")
 
     # --- Load precomputed latents ---
     ae_dir = os.path.dirname(args.ae_ckpt)
-    train_z = np.load(os.path.join(ae_dir, "train_latents.npy"))
-    train_y = np.load(os.path.join(ae_dir, "train_labels.npy"))
+    train_z = np.load(os.path.join(ae_dir, "vmf_train_latents.npy"))
+    train_y = np.load(os.path.join(ae_dir, "vmf_train_labels.npy"))
 
     # Load stats saved by encode_latents.py for inverting the projection.
-    latent_mean = torch.from_numpy(
-        np.load(os.path.join(ae_dir, "latent_mean.npy"))
-    ).float().to(device)
-    latent_std = torch.from_numpy(
-        np.load(os.path.join(ae_dir, "latent_std.npy"))
-    ).float().to(device)
+    # latent_mean = torch.from_numpy(
+    #     np.load(os.path.join(ae_dir, "latent_mean.npy"))
+    # ).float().to(device)
+    # latent_std = torch.from_numpy(
+    #     np.load(os.path.join(ae_dir, "latent_std.npy"))
+    # ).float().to(device)
 
 
     dataset = LatentDataset(train_z, train_y, device)
@@ -239,7 +239,7 @@ def main() -> None:
     gen = MLPGenerator(
         num_classes=dataset.num_classes,
         noise_dim=args.noise_dim,
-        latent_dim=latent_dim+1,
+        latent_dim=latent_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
     ).to(device)
@@ -306,6 +306,8 @@ def main() -> None:
             stats: dict[str, float] = {}
             # mask_self_neg: False for sinkhorn (matches ALAE), True for others.
             mask_self_neg = (args.coupling != "sinkhorn")
+            # print("nneg:", args.nneg, "npos:", args.npos, "layers:")
+
             loss = drifting_loss_for_feature_set(
                 x_feat, y_pos_feat, y_unc_feat,
                 omega=omega,
@@ -326,6 +328,7 @@ def main() -> None:
                 vmf_marginals=args.vmf,
                 vmf_kappa=args.kappa
             )
+            # print("loss:", loss.item())
 
             # Accumulate (average over classes).
             loss_scaled = loss / nc
@@ -358,7 +361,7 @@ def main() -> None:
             orig_state = {n: p.clone() for n, p in gen.named_parameters() if p.requires_grad}
             ema.copy_to(gen)
 
-            grid = sample_grid(gen, ae, omega=args.sample_omega, nrow=args.sample_nrow, device=device, latent_mean=latent_mean, latent_std=latent_std)
+            grid = sample_grid(gen, ae, omega=args.sample_omega, nrow=args.sample_nrow, device=device)
             fig_path = os.path.join(run_dir, f"sample_step{step}.png")
             save_image(grid, fig_path, nrow=args.sample_nrow, padding=1)
             print(f"  -> saved sample grid: {fig_path}")

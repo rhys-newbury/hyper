@@ -40,26 +40,26 @@ import ot
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-
+import torch.nn.functional as F
 from mnist.models import ConvAE, MLPGenerator
 
-
+from mnist.vmf_vae import ConvModelVAE 
 # ---------------------------------------------------------------------------
 # Stereographic projection (inverse only — forward is used at encode time)
 # ---------------------------------------------------------------------------
 
-def stereo_inverse(s: torch.Tensor) -> torch.Tensor:
-    """Inverse stereographic projection S^d -> R^d.
+# def stereo_inverse(s: torch.Tensor) -> torch.Tensor:
+#     """Inverse stereographic projection S^d -> R^d.
 
-    Args:
-        s: (N, d+1) points on the unit sphere.
+#     Args:
+#         s: (N, d+1) points on the unit sphere.
 
-    Returns:
-        w: (N, d) standardized latents.
-    """
-    s_body = s[..., :-1]
-    s_last = s[..., -1:].clamp(max=1.0 - 1e-6)  # guard against north pole
-    return s_body / (1.0 - s_last)
+#     Returns:
+#         w: (N, d) standardized latents.
+#     """
+#     s_body = s[..., :-1]
+#     s_last = s[..., -1:].clamp(max=1.0 - 1e-6)  # guard against north pole
+#     return s_body / (1.0 - s_last)
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +105,6 @@ def compute_emd(X: np.ndarray, Y: np.ndarray) -> float:
 def generate_samples(
     gen: MLPGenerator,
     ae: ConvAE,
-    latent_mean: torch.Tensor,
-    latent_std: torch.Tensor,
     *,
     num_classes: int,
     counts_per_class: dict[int, int],
@@ -124,15 +122,19 @@ def generate_samples(
 
     for c in range(num_classes):
         n_c = counts_per_class[c]
-        noise = torch.randn(n_c, gen.noise_dim, device=device)
+        # noise = torch.randn(n_c, gen.noise_dim, device=device)
+        noise = F.normalize(torch.randn(n_c, gen.noise_dim, device=device), dim=-1)
+
         labels = torch.full((n_c,), c, dtype=torch.long, device=device)
         omegas = torch.full((n_c,), omega, device=device)
 
-        s = gen(noise, labels, omegas)           # (N_c, D+1) on sphere
-        z_norm = stereo_inverse(s)               # (N_c, D)   standardized
-        z = z_norm * latent_std + latent_mean    # (N_c, D)   raw AE latent
+        z = gen(noise, labels, omegas)           # (N_c, D+1) on sphere
+        # z_norm = stereo_inverse(s)               # (N_c, D)   standardized
+        # z = z_norm * latent_std + latent_mean    # (N_c, D)   raw AE latent
+        # import pdb; pdb.set_trace()
 
-        imgs = ae.decode(z)                      # (N_c, 1, 28, 28)
+        imgs_logits = ae.decode(z)                      # (N_c, 1, 28, 28)
+        imgs = torch.sigmoid(imgs_logits)
 
         latents_by_class[c] = z.cpu().numpy()
         images_by_class[c] = imgs.cpu().view(n_c, -1).numpy()
@@ -151,8 +153,6 @@ def get_real_samples(
     n_per_class: int,
     device: torch.device,
     data_root: str,
-    latent_mean: torch.Tensor,
-    latent_std: torch.Tensor,
     precomputed_latents: np.ndarray | None = None,
     precomputed_labels: np.ndarray | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, int]]:
@@ -173,7 +173,7 @@ def get_real_samples(
 
     all_imgs, all_labels, all_latents = [], [], []
     for imgs, labels in loader:
-        z = ae.encode(imgs.to(device))
+        z, _ = ae.encode(imgs.to(device))
         all_imgs.append(imgs.view(imgs.shape[0], -1).numpy())
         all_labels.append(labels.numpy())
         all_latents.append(z.cpu().numpy())
@@ -186,9 +186,9 @@ def get_real_samples(
     # so the comparison is consistent with generate_samples.
     if precomputed_latents is not None and precomputed_labels is not None:
         s_t = torch.from_numpy(precomputed_latents).float()
-        z_norm = stereo_inverse(s_t)                            # (N, D)
-        z_raw  = (z_norm * latent_std.cpu() + latent_mean.cpu()).numpy()
-        all_latents_np   = z_raw
+        # z_norm = stereo_inverse(s_t)                            # (N, D)
+        # z_raw  = (z_norm * latent_std.cpu() + latent_mean.cpu()).numpy()
+        all_latents_np   = s_t.cpu().numpy()
         all_labels_np_lat = precomputed_labels
     else:
         all_labels_np_lat = all_labels_np
@@ -228,7 +228,7 @@ def load_generator(ckpt_path: str, device: torch.device) -> MLPGenerator:
     gen = MLPGenerator(
         num_classes=cfg["num_classes"],
         noise_dim=cfg["noise_dim"],
-        latent_dim=cfg["latent_dim"]+1,   # sphere dim = ae_latent_dim + 1
+        latent_dim=cfg["latent_dim"],   # sphere dim = ae_latent_dim + 1
         hidden_dim=cfg["hidden_dim"],
         num_layers=cfg["num_layers"],
     ).to(device)
@@ -250,8 +250,8 @@ def evaluate_one(
     real_latents: dict[int, np.ndarray],
     real_images: dict[int, np.ndarray],
     counts_per_class: dict[int, int],
-    latent_mean: torch.Tensor,
-    latent_std: torch.Tensor,
+    # latent_mean: torch.Tensor,
+    # latent_std: torch.Tensor,
     *,
     omega: float,
     device: torch.device,
@@ -266,8 +266,7 @@ def evaluate_one(
     print(f"{'='*60}")
 
     gen_latents, gen_images = generate_samples(
-        gen, ae, latent_mean, latent_std,
-        num_classes=gen.num_classes,
+        gen, ae,        num_classes=gen.num_classes,
         counts_per_class=counts_per_class,
         omega=omega,
         device=device,
@@ -351,25 +350,26 @@ def main() -> None:
 
     # Load AE.
     ae_ckpt = torch.load(args.ae_ckpt, map_location="cpu", weights_only=True)
-    latent_dim = ae_ckpt["latent_dim"]
-    ae = ConvAE(latent_dim=latent_dim).to(device)
-    ae.load_state_dict(ae_ckpt["model"])
+    latent_dim = 16 #ae_ckpt["latent_dim"]
+    ae = ConvModelVAE(z_dim=latent_dim, distribution="vmf").to(device)
+    state = ae_ckpt.get("model_state_dict", ae_ckpt.get("model"))
+    ae.load_state_dict(state)
     ae.eval()
     print(f"AE: latent_dim={latent_dim}")
 
     # Load normalization stats saved by encode_latents.py.
     ae_dir = os.path.dirname(args.ae_ckpt)
-    latent_mean = torch.from_numpy(
-        np.load(os.path.join(ae_dir, "latent_mean.npy"))
-    ).float().to(device)
-    latent_std = torch.from_numpy(
-        np.load(os.path.join(ae_dir, "latent_std.npy"))
-    ).float().to(device)
-    print(f"Loaded normalization stats: mean={latent_mean.mean():.4f}, std={latent_std.mean():.4f}")
+    # latent_mean = torch.from_numpy(
+    #     np.load(os.path.join(ae_dir, "latent_mean.npy"))
+    # ).float().to(device)
+    # latent_std = torch.from_numpy(
+    #     np.load(os.path.join(ae_dir, "latent_std.npy"))
+    # ).float().to(device)
+    # print(f"Loaded normalization stats: mean={latent_mean.mean():.4f}, std={latent_std.mean():.4f}")
 
     # Load precomputed sphere test latents if available.
-    test_lat_path = os.path.join(ae_dir, "test_latents.npy")
-    test_lbl_path = os.path.join(ae_dir, "test_labels.npy")
+    test_lat_path = os.path.join(ae_dir, "vmf_test_latents.npy")
+    test_lbl_path = os.path.join(ae_dir, "vmf_test_labels.npy")
     precomputed_lat, precomputed_lbl = None, None
     if os.path.exists(test_lat_path):
         precomputed_lat = np.load(test_lat_path)   # (N, D+1) sphere points
@@ -383,8 +383,6 @@ def main() -> None:
         n_per_class=args.n_samples,
         device=device,
         data_root=args.data_root,
-        latent_mean=latent_mean,
-        latent_std=latent_std,
         precomputed_latents=precomputed_lat,
         precomputed_labels=precomputed_lbl,
     )
@@ -396,7 +394,6 @@ def main() -> None:
     for ckpt_path in args.gen_ckpt:
         result = evaluate_one(
             ckpt_path, ae, real_latents, real_images, counts_per_class,
-            latent_mean, latent_std,
             omega=args.omega,
             device=device,
         )
