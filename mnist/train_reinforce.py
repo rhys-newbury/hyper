@@ -64,7 +64,7 @@ def reinforce_loss(gen: Tensor, pos: Tensor, temp: float = 0.05) -> Tensor:
         log_q_val, log_p_val = estimate_kl(gen, pos, gen, temp=temp)
         advantage = (log_q_val - log_p_val)
         # normalized becomes worse; subtract mean becomes worse; divide by std is better
-        advantage = advantage * 0 # / (advantage.std() + 1e-6)
+        advantage = advantage # / (advantage.std() + 1e-6)
 
     # Score function: query detached, centers live so gradients flow
     x_query = gen.detach()
