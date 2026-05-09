@@ -19,62 +19,48 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch import Tensor
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
 from core.models.ema import EMA
-from mnist.models import ConvAE, MLPGenerator
+from mnist.models import ConvAE
+from mnist.eval_emd import compute_emd
 
 
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
-def estimate_kl(
-    x: Tensor,
-    y_pos: Tensor,
-    y_neg: Tensor,
+def kde_logp(
+    query: Tensor,
+    center: Tensor,
     temp: float = 0.05,
-) -> tuple[Tensor, Tensor]:
-    """KDE log-density estimates under Laplace kernel k(x,y) = exp(-‖x-y‖/temp).
-
-    Returns (log_q, log_p) per query point in x.
-    """
-    N, N_pos, N_neg = x.shape[0], y_pos.shape[0], y_neg.shape[0]
-
-    dist_pos = torch.cdist(x, y_pos)
-    dist_neg = torch.cdist(x, y_neg)
-
-    if N == N_neg:
-        dist_neg = dist_neg + torch.eye(N, device=x.device) * 1e6
-
-    log_p = torch.logsumexp(-dist_pos / temp, dim=1) - np.log(N_pos)
-    log_q = torch.logsumexp(-dist_neg / temp, dim=1) - np.log(N_neg - 1 if N == N_neg else N_neg)
-
-    return log_q, log_p
+    leave_one_out: bool = False,
+):
+    dist = torch.cdist(query, center)
+    if leave_one_out:
+        dist = dist + torch.eye(len(query), device=query.device) * 1e6
+        log_q = torch.logsumexp(-dist / temp, dim=1) - np.log(len(query) - 1)
+    else:
+        log_q = torch.logsumexp(-dist / temp, dim=1) - np.log(len(center))
+    return log_q
 
 
-def reinforce_loss(gen: Tensor, pos: Tensor, temp: float = 0.05) -> Tensor:
+def reinforce_loss(gen: Tensor, pos: Tensor, temp: float = 0.05, maxent_coef=0.0) -> Tensor:
     """REINFORCE with KDE reward: advantage * score-function gradient of log q.
 
     gen: [N, D] generated samples (requires_grad)
     pos: [N_pos, D] real samples (no grad needed)
     """
-    with torch.no_grad():
-        log_q_val, log_p_val = estimate_kl(gen, pos, gen, temp=temp)
-        advantage = (log_q_val - log_p_val)
-        # normalized becomes worse; subtract mean becomes worse; divide by std is better
-        advantage = advantage # / (advantage.std() + 1e-6)
-
-    # Score function: query detached, centers live so gradients flow
-    x_query = gen.detach()
-    x_centers = gen
-    dist = torch.cdist(x_query, x_centers)
-    dist = dist + torch.eye(len(gen), device=gen.device) * 1e6
-    log_q_score = torch.logsumexp(-dist / temp, dim=1) - np.log(len(gen) - 1)
-
-    return (log_q_score * advantage).mean()
-
+    log_q = kde_logp(gen.detach(), gen, temp=temp, leave_one_out=True)  # [N] log q̂ leave-one-out KDE estimate for each gen point
+    log_p = kde_logp(gen.detach(), pos, temp=temp, leave_one_out=False)  # [N] log p̂ KDE estimate for each gen point
+    
+    reward = ((1 + maxent_coef) * log_q - log_p).detach()
+    loss  = (log_q * reward).mean()
+    return loss
 
 # ---------------------------------------------------------------------------
 # Args
@@ -84,7 +70,6 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train MNIST MLP generator with REINFORCE KDE loss.")
 
     p.add_argument("--ae-ckpt", type=str, required=True, help="Path to ae_final.pt")
-    p.add_argument("--data-root", type=str, default="./data")
 
     p.add_argument("--noise-dim", type=int, default=6)
     p.add_argument("--hidden-dim", type=int, default=256)
@@ -108,6 +93,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--sample-nrow", type=int, default=10)
 
+    p.add_argument("--data-root", type=str, default="./data")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--run-root", type=str, default="runs/mnist_reinforce")
@@ -137,6 +123,71 @@ class LatentDataset:
         sel = idx[torch.randint(len(idx), (n,), device=self.device)]
         return self.latents[sel]
 
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+
+class MLPGenerator(nn.Module):
+    """MLP generator for drifting in latent space.
+
+    Interface matches DiTLatentB2: forward(noise, class_labels, omega) -> latent.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 10,
+        noise_dim: int = 6,
+        latent_dim: int = 6,
+        hidden_dim: int = 256,
+        num_layers: int = 3,
+        class_emb_dim: int = 32,
+        omega_emb_dim: int = 32,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.noise_dim = noise_dim
+        self.latent_dim = latent_dim
+
+        # Class conditioning: +1 for unconditional token (index = num_classes)
+        self.class_emb = nn.Embedding(num_classes + 1, class_emb_dim)
+
+        # Omega conditioning
+        self.omega_mlp = nn.Sequential(
+            nn.Linear(1, omega_emb_dim),
+            nn.SiLU(),
+            nn.Linear(omega_emb_dim, omega_emb_dim),
+        )
+
+        # MLP body: [noise + class_emb + omega_emb] -> hidden -> ... -> latent_dim
+        in_dim = noise_dim + class_emb_dim + omega_emb_dim
+        layers: list[nn.Module] = []
+        for _ in range(num_layers):
+            layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True)])
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, latent_dim))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        noise: torch.Tensor,
+        class_labels: torch.Tensor,
+        omega: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        noise:        [B, noise_dim]
+        class_labels: [B] int64, 0..num_classes-1 or -1 for unconditional
+        omega:        [B] float, CFG scale
+        returns:      [B, latent_dim]
+        """
+        b = noise.shape[0]
+        cls = class_labels.clone()
+        cls = torch.where(cls < 0, torch.full_like(cls, self.num_classes), cls)
+        c_emb = self.class_emb(cls)
+        o_emb = self.omega_mlp(omega.view(b, 1))
+        inp = torch.cat([noise, c_emb, o_emb], dim=-1)
+        return self.mlp(inp)
+
 
 # ---------------------------------------------------------------------------
 # LR schedule
@@ -147,6 +198,7 @@ def set_lr(optimizer: torch.optim.Optimizer, step: int, warmup: int, base_lr: fl
     for pg in optimizer.param_groups:
         pg["lr"] = lr
     return lr
+
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +242,20 @@ def main() -> None:
         p.requires_grad_(False)
     print(f"AE: latent_dim={latent_dim}, epoch={ae_ckpt['epoch']}, test_loss={ae_ckpt['test_loss']:.6f}")
 
-    # --- Load precomputed latents ---
-    ae_dir = os.path.dirname(args.ae_ckpt)
-    train_z = np.load(os.path.join(ae_dir, "train_latents.npy"))
-    train_y = np.load(os.path.join(ae_dir, "train_labels.npy"))
+    # --- Encode MNIST train set online ---
+    tf = transforms.ToTensor()
+    mnist_train = datasets.MNIST(root=args.data_root, train=True, download=True, transform=tf)
+    loader = DataLoader(mnist_train, batch_size=512, shuffle=False, num_workers=4, pin_memory=True)
+    print("Encoding MNIST train set...")
+    all_z, all_y = [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            all_z.append(ae.encode(imgs.to(device)).cpu().numpy())
+            all_y.append(labels.numpy())
+    train_z = np.concatenate(all_z, axis=0)
+    train_y = np.concatenate(all_y, axis=0)
     dataset = LatentDataset(train_z, train_y, device)
-    print(f"Loaded {len(train_z)} train latents, {dataset.num_classes} classes")
+    print(f"Encoded {len(train_z)} train latents, {dataset.num_classes} classes")
 
     # --- Generator (omega is a dummy input; always passed as 1.0) ---
     gen = MLPGenerator(
@@ -239,7 +299,6 @@ def main() -> None:
             x_lat = gen(noise, c_labels, omega_dummy)          # [nneg, latent_dim]
 
             pos_lat = dataset.sample_class(c, args.npos)       # [npos, latent_dim]
-
             loss = reinforce_loss(x_lat, pos_lat, temp=args.temp)
             (loss / nc).backward()
             total_loss += loss.item()
@@ -294,6 +353,45 @@ def main() -> None:
             if step == args.steps:
                 print(f"Saved final: {os.path.join(run_dir, tag)}")
 
+    # --- EMD evaluation ---
+    print("\nEvaluating EMD...")
+    ema.copy_to(gen)
+    gen.eval()
+    tf_test = transforms.ToTensor()
+    test_ds = datasets.MNIST(root=args.data_root, train=False, download=True, transform=tf_test)
+    test_loader = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=4)
+
+    all_z_real, all_y_real = [], []
+    all_imgs_real = []
+    with torch.no_grad():
+        for imgs, labels in test_loader:
+            all_z_real.append(ae.encode(imgs.to(device)).cpu().numpy())
+            all_imgs_real.append(imgs.view(imgs.shape[0], -1).numpy())
+            all_y_real.append(labels.numpy())
+    z_real_all  = np.concatenate(all_z_real,  axis=0)
+    imgs_real_all = np.concatenate(all_imgs_real, axis=0)
+    y_real_all  = np.concatenate(all_y_real,  axis=0)
+
+    omega_eval = torch.ones(args.nneg, device=device)
+    emd_lat_list, emd_img_list = [], []
+    for c in range(dataset.num_classes):
+        idx = np.where(y_real_all == c)[0]
+        z_real_c   = z_real_all[idx]
+        imgs_real_c = imgs_real_all[idx]
+
+        with torch.no_grad():
+            noise  = torch.randn(len(idx), args.noise_dim, device=device)
+            labels = torch.full((len(idx),), c, dtype=torch.long, device=device)
+            z_gen  = gen(noise, labels, torch.ones(len(idx), device=device)).cpu().numpy()
+            imgs_gen = ae.decode(torch.from_numpy(z_gen).to(device)).cpu().view(len(idx), -1).numpy()
+
+        emd_lat = compute_emd(z_gen, z_real_c)
+        emd_img = compute_emd(imgs_gen, imgs_real_c)
+        emd_lat_list.append(emd_lat)
+        emd_img_list.append(emd_img)
+        print(f"  Class {c}: EMD_latent={emd_lat:.6f}  EMD_image={emd_img:.6f}")
+
+    print(f"  Average:  EMD_latent={np.mean(emd_lat_list):.6f}  EMD_image={np.mean(emd_img_list):.6f}")
     print("Done.")
 
 
