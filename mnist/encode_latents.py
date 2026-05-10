@@ -34,28 +34,6 @@ from mnist.models import ConvAE
 # Stereographic projection
 # ---------------------------------------------------------------------------
 
-def stereo_project(w: torch.Tensor) -> torch.Tensor:
-    """Stereographic projection R^d -> S^d (unit sphere in R^(d+1))."""
-    sq = (w ** 2).sum(dim=-1, keepdim=True)   
-    s_body = 2.0 * w / (1.0 + sq)             
-    s_last = (sq - 1.0) / (1.0 + sq)          
-    return torch.cat([s_body, s_last], dim=-1) 
-
-
-def stereo_inverse(s: torch.Tensor) -> torch.Tensor:
-    """Inverse stereographic projection S^d -> R^d.
-
-    Args:
-        s: (N, d+1) points on the unit sphere.
-
-    Returns:
-        w: (N, d) standardized latents.
-    """
-    s_body = s[..., :-1]
-    s_last = s[..., -1:].clamp(max=1.0 - 1e-6)  # guard against north pole
-    return s_body / (1.0 - s_last)
-
-
 # ---------------------------------------------------------------------------
 # Encoding
 # ---------------------------------------------------------------------------
@@ -106,44 +84,15 @@ def main() -> None:
     # Encode raw latents.
     train_z, train_y = encode_split(ae, train_loader, device)
     test_z,  test_y  = encode_split(ae, test_loader,  device)
-    print(f"Train: {train_z.shape}, Test: {test_z.shape}")
-    print(f"Latent stats (train): mean={train_z.mean():.4f}, std={train_z.std():.4f}, "
-          f"min={train_z.min():.4f}, max={train_z.max():.4f}")
-
-    # ------------------------------------------------------------------
-    # Standardize (fit on train only) then project to unit sphere.
-    # ------------------------------------------------------------------
-    train_t = torch.from_numpy(train_z)
-    test_t  = torch.from_numpy(test_z)
-
-    mu  = train_t.mean(dim=0)               # (D,)
-    std = train_t.std(dim=0).clamp_min(1e-6)# (D,)
-
-    train_norm = (train_t - mu) / std
-    test_norm  = (test_t  - mu) / std       # use train stats for test
-
-    train_s = stereo_project(train_norm)    # (N, D+1)
-    test_s  = stereo_project(test_norm)     # (N, D+1)
-
-    # Sanity checks.
-    train_norms = train_s.norm(dim=-1)
-    print(f"[stereo] sphere dim: {train_s.shape[1]}  (latent_dim + 1 = {latent_dim} + 1)")
-    print(f"[stereo] train norm  mean={train_norms.mean():.6f}  "
-          f"min={train_norms.min():.6f}  max={train_norms.max():.6f}  (should all be 1.0)")
-    roundtrip_err = (stereo_inverse(train_s) - train_norm).abs().max().item()
-    print(f"[stereo] max roundtrip error: {roundtrip_err:.2e}  (should be ~1e-6)")
 
     # Save.
     out_dir = os.path.dirname(args.ae_ckpt)
 
-    np.save(os.path.join(out_dir, "latent_mean.npy"), mu.numpy().astype(np.float32))
-    np.save(os.path.join(out_dir, "latent_std.npy"),  std.numpy().astype(np.float32))
-
-    for name, s, y in [("train", train_s, train_y), ("test", test_s, test_y)]:
-        np.save(os.path.join(out_dir, f"{name}_latents.npy"), s.numpy().astype(np.float32))
+    for name, s, y in [("train", train_z, train_y), ("test", test_z, test_y)]:
+        np.save(os.path.join(out_dir, f"{name}_latents.npy"), s.astype(np.float32))
         np.save(os.path.join(out_dir, f"{name}_labels.npy"),  y)
 
-    print(f"Saved sphere latents (shape {train_s.shape}) and stats to {out_dir}/")
+    print(f"Saved sphere latents (shape {train_z.shape}) and stats to {out_dir}/")
 
 
 if __name__ == "__main__":
