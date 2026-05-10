@@ -60,7 +60,9 @@ def reinforce_loss(gen: Tensor, pos: Tensor, temp: float = 0.05, maxent_coef=0.0
     
     reward = ((1 + maxent_coef) * log_q - log_p).detach()
     loss  = (log_q * reward).mean()
-    return loss
+    return loss, (log_q - log_p).mean().item()
+
+
 
 # ---------------------------------------------------------------------------
 # Args
@@ -122,6 +124,9 @@ class LatentDataset:
         idx = self.class_indices[c]
         sel = idx[torch.randint(len(idx), (n,), device=self.device)]
         return self.latents[sel]
+
+    def get_class(self, c: int) -> torch.Tensor:
+        return self.latents[self.class_indices[c]]
 
 # ---------------------------------------------------------------------------
 # Model
@@ -299,7 +304,7 @@ def main() -> None:
             x_lat = gen(noise, c_labels, omega_dummy)          # [nneg, latent_dim]
 
             pos_lat = dataset.sample_class(c, args.npos)       # [npos, latent_dim]
-            loss = reinforce_loss(x_lat, pos_lat, temp=args.temp)
+            loss, loss_vis = reinforce_loss(x_lat, pos_lat, temp=args.temp)
             (loss / nc).backward()
             total_loss += loss.item()
 
@@ -311,10 +316,10 @@ def main() -> None:
         # --- Logging ---
         if step % args.log_every == 0 or step == 1:
             avg_loss = total_loss / nc
-            rec = {"step": step, "loss": round(avg_loss, 6), "lr": round(lr, 8)}
+            rec = {"step": step, "loss": round(avg_loss, 6), "lr": round(lr, 8), "loss_vis": loss_vis}
             with open(log_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
-            print(f"[{step}/{args.steps}] loss={avg_loss:.6f} lr={lr:.2e}")
+            print(f"[{step}/{args.steps}] loss={avg_loss:.6f} loss_vis={loss_vis:.6f} lr={lr:.2e}")
 
         # --- Sampling ---
         if step % args.sample_every == 0 or step == args.steps:
