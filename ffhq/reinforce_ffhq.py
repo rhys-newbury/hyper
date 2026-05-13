@@ -421,6 +421,19 @@ def plot_pca_trajectory(
     print(f"[plot] {save_path}")
 
 
+def clone_trainable_params(model):
+    return {
+        n: p.detach().clone()
+        for n, p in model.named_parameters()
+        if p.requires_grad
+    }
+
+@torch.no_grad()
+def restore_trainable_params(model, state):
+    for n, p in model.named_parameters():
+        if n in state:
+            p.copy_(state[n])
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -626,10 +639,7 @@ def main() -> None:
             torch.save(ckpt, path)
             print(f"  [ckpt] {path}")
 
-            # Restore live weights after save
-            for n, p in gen.named_parameters():
-                if p.requires_grad:
-                    p.data.copy_(ema.shadow[n])   # ema already copied above
+            restore_trainable_params(gen, live_state)
 
     # ── Final snapshot ────────────────────────────────────────────────────────
     take_snapshot("final")
