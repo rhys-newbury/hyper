@@ -26,6 +26,12 @@ try:
 except ImportError:
     ot = None
 
+try:
+    from sklearn.decomposition import PCA as SklearnPCA
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -113,6 +119,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Samples per class for EMD evaluation.")
     p.add_argument("--log-every",    type=int, default=50)
     p.add_argument("--save-every",   type=int, default=1000)
+    p.add_argument("--pca-plot",     type=str, default="reinforce_ffhq_pca.png")
 
     # Misc
     p.add_argument("--device", type=str, default="cuda")
@@ -347,6 +354,73 @@ def _plot_loss(steps: List[int], losses: List[float],
     print(f"[plot] {path}")
 
 
+def plot_pca_trajectory(
+    snapshots_by_class: Dict[str, Dict[int, torch.Tensor]],
+    target_latents: Dict[int, torch.Tensor],
+    save_path: str,
+) -> None:
+    """
+    PCA scatter coloured by class showing:
+      • target distribution (solid markers)
+      • initial generator state (faint)
+      • final generator state (vivid)
+    """
+    if not _HAS_SKLEARN:
+        print("[plot] scikit-learn not found; skipping PCA plot.")
+        return
+
+    # Collect all points for PCA fitting
+    all_pts = []
+    for cid in range(N_CLASSES):
+        for snap_dict in snapshots_by_class.values():
+            if cid in snap_dict:
+                all_pts.append(snap_dict[cid])
+        if cid in target_latents:
+            all_pts.append(target_latents[cid])
+    all_pts_np = torch.cat(all_pts, dim=0).cpu().numpy()
+
+    pca = SklearnPCA(n_components=2)
+    pca.fit(all_pts_np)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    titles = ["Initial (step 1)", "Final (last step)"]
+    keys   = ["source", "final"]
+    alphas = [0.3, 0.65]
+
+    for ax, key, alpha, title in zip(axes, keys, alphas, titles):
+        snap = snapshots_by_class.get(key, {})
+        for cid, name in enumerate(CLASS_NAMES):
+            color = CLASS_COLORS[cid]
+            # Generated
+            if cid in snap:
+                pts = pca.transform(snap[cid].cpu().numpy())
+                ax.scatter(pts[:, 0], pts[:, 1],
+                           s=4, alpha=alpha, color=color,
+                           label=f"gen {name}" if key == "final" else None,
+                           rasterized=True)
+            # Target
+            if cid in target_latents:
+                tgt = pca.transform(target_latents[cid].cpu().numpy())
+                ax.scatter(tgt[:, 0], tgt[:, 1],
+                           s=4, alpha=0.2, color=color,
+                           marker="^", rasterized=True,
+                           label=f"tgt {name}" if key == "final" else None)
+
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel(f"PC 1  ({pca.explained_variance_ratio_[0]*100:.1f}%)", fontsize=9)
+        ax.set_ylabel(f"PC 2  ({pca.explained_variance_ratio_[1]*100:.1f}%)", fontsize=9)
+        ax.grid(alpha=0.2)
+
+    # Single legend from the "final" panel
+    axes[1].legend(fontsize=6, markerscale=2, ncol=2,
+                   bbox_to_anchor=(1.01, 1), loc="upper left")
+    plt.suptitle("Conditional REINFORCE: PCA snapshots (initial vs target)", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] {save_path}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,12 +496,37 @@ def main() -> None:
     emd_global:   List[float]            = []
     emd_perclass: Dict[int, List[float]] = {i: [] for i in range(N_CLASSES)}
 
+    # ── PCA snapshot storage ──────────────────────────────────────────────────
+    pca_snapshots: Dict[str, Dict[int, torch.Tensor]] = {}
+
+    def take_snapshot(tag: str) -> None:
+        # Swap in EMA weights temporarily
+        live_state = {n: p.clone() for n, p in gen.named_parameters()
+                      if p.requires_grad}
+        ema.copy_to(gen)
+        gen.eval()
+        with torch.no_grad():
+            gen_eval = gen(eval_noise, eval_labels)                # (emd_samples*6, 512)
+        snap = {}
+        for cid in range(N_CLASSES):
+            mask = (eval_labels == cid)
+            snap[cid] = gen_eval[mask].cpu()
+        pca_snapshots[tag] = snap
+        # Restore live weights
+        for n, p in gen.named_parameters():
+            if n in live_state:
+                p.data.copy_(live_state[n])
+        gen.train()
+
     # ── Training loop ─────────────────────────────────────────────────────────
     print(f"{'Step':>6}  {'Loss':>12}  {'KL-proxy':>10}  {'EMD²(global)':>14}  {'LR':>9}")
     print("─" * 60)
 
     gen.train()
     for step in range(1, args.steps + 1):
+        if step == 1:
+            take_snapshot("source")
+
         lr = set_lr(opt, step - 1, args.warmup_steps, args.lr, args.emb_lr)
         opt.zero_grad()
 
@@ -532,6 +631,9 @@ def main() -> None:
                 if p.requires_grad:
                     p.data.copy_(ema.shadow[n])   # ema already copied above
 
+    # ── Final snapshot ────────────────────────────────────────────────────────
+    take_snapshot("final")
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     if emd_steps:
         _plot_emd_global(emd_steps, emd_global,
@@ -542,6 +644,11 @@ def main() -> None:
     if log_steps:
         _plot_loss(log_steps, log_losses, log_kls,
                    os.path.join(run_dir, "loss.png"))
+
+    # PCA plot
+    pca_target_cpu = {cid: t.cpu() for cid, t in eval_target.items()}
+    plot_pca_trajectory(pca_snapshots, pca_target_cpu,
+                        os.path.join(run_dir, args.pca_plot))
 
     # ── Final summary ─────────────────────────────────────────────────────────
     if emd_global:
