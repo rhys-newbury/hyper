@@ -123,6 +123,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--sinkhorn-iters", type=int,   default=30)
     p.add_argument("--dist",           type=str,   default="l2_sq",
                    choices=["l2_sq", "l2", "cosine"])
+    p.add_argument("--temp",           type=float, default=0.01, 
+                   help="Temperature for KDE log-prob weighting of drift.")
 
     # Evaluation
     p.add_argument("--emd-every",   type=int, default=100)
@@ -442,7 +444,7 @@ def conditional_drift_loss(
         
         adv = (gpq - gqq).detach()
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)   # ← critical
-        log_q = kde_logp(fx_c.detach(), fx_c, temp=0.01, leave_one_out=True)
+        log_q = kde_logp(fx_c.detach(), fx_c, temp=args.temp, leave_one_out=True)
         
         total_loss = total_loss + (adv * log_q).sum()
         # diff       = fx_c - target_c      # grad flows through fx_c
