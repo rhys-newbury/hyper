@@ -406,6 +406,7 @@ def conditional_drift_loss(
     plan_type:    str,
     dist_metric:  str,
     sinkhorn_iters: int,
+    kde_temp:    float
 ) -> torch.Tensor:
     """
     Conditional drift loss.
@@ -444,7 +445,7 @@ def conditional_drift_loss(
         
         adv = (gpq - gqq).detach()
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)   # ← critical
-        log_q = kde_logp(fx_c.detach(), fx_c, temp=args.temp, leave_one_out=True)
+        log_q = kde_logp(fx_c.detach(), fx_c, temp=kde_temp, leave_one_out=True)
         
         total_loss = total_loss + (adv * log_q).sum()
         # diff       = fx_c - target_c      # grad flows through fx_c
@@ -731,6 +732,7 @@ def main() -> None:
             plan_type       = args.plan,
             dist_metric     = args.dist,
             sinkhorn_iters  = args.sinkhorn_iters,
+            kde_temp        = args.temp,
         )
 
         optimizer.zero_grad()
