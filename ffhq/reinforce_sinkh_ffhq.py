@@ -442,7 +442,7 @@ def conditional_drift_loss(
         
         adv = (gpq - gqq).detach()
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)   # ← critical
-        log_q = kde_logp(fx_c.detach(), fx_c, temp=1.0, leave_one_out=True)
+        log_q = kde_logp(fx_c.detach(), fx_c, temp=0.01, leave_one_out=True)
         
         total_loss = total_loss + (adv * log_q).sum()
         # diff       = fx_c - target_c      # grad flows through fx_c
